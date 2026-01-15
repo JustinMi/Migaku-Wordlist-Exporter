@@ -13,10 +13,17 @@
 // ==/UserScript==
 
 
+// ID assigned to the status message element injected into the Migaku UI.
 const statusMessageElemId = "mgkexporterStatusMessage";
+// IndexedDB object store name used to cache media blobs between exports.
 const STORENAME_MEDIACACHE = "mediacache"
 
 
+/**
+ * Decompresses a gzipped Blob into a Uint8Array.
+ * @param {Blob} blob - Gzipped blob read from IndexedDB.
+ * @returns {Promise<Uint8Array>} Resolved with the decompressed bytes.
+ */
 const decompress = async (blob) => {
     const ds = new DecompressionStream("gzip");
     const decompressedStream = blob.stream().pipeThrough(ds);
@@ -40,6 +47,10 @@ const decompress = async (blob) => {
 
 
 
+/**
+ * Reads Firebase auth info that Migaku stores in IndexedDB.
+ * @returns {Promise<any[]>} Promise resolving to all rows in firebaseLocalStorage.
+ */
 const fetchFirebaseLocalStorageDbRows = () => {
     return new Promise((resolve) => {
         console.log("Fetching firebase database")
@@ -56,23 +67,39 @@ const fetchFirebaseLocalStorageDbRows = () => {
     });
 };
 
+/**
+ * Exchanges a Firebase refresh token for an access token.
+ * @param {string} firebaseApiKey - Firebase API key stored in IndexedDB.
+ * @param {string} refreshToken - Refresh token used to obtain a new access token.
+ * @returns {Promise<any>} JSON response from Google's securetoken endpoint.
+ */
 const fetchGoogleAuth = async (firebaseApiKey, refreshToken) => {
     const url = `https://securetoken.googleapis.com/v1/token?key=${firebaseApiKey}`
-    const resp = await fetch(url, {method: "post", body: new URLSearchParams({
-        "grant_type": "refresh_token",
-        "refresh_token": refreshToken,
-    })});
+    const resp = await fetch(url, {
+        method: "post", body: new URLSearchParams({
+            "grant_type": "refresh_token",
+            "refresh_token": refreshToken,
+        })
+    });
     return await resp.json();
 };
 
+/**
+ * Retrieves the current Firebase access token and its expiration.
+ * @returns {Promise<{token: string, expiresAt: number}>} Access token with expiration timestamp (ms).
+ */
 const fetchAccessToken = async () => {
     const firebaseInfo = (await fetchFirebaseLocalStorageDbRows())[0].value;
     const auth = await fetchGoogleAuth(firebaseInfo.apiKey, firebaseInfo.stsTokenManager.refreshToken);
     let exp = Date.now() + ((Number(auth.expires_in) - 5) * 1000);
-    return {token: auth.access_token, expiresAt: exp};
+    return { token: auth.access_token, expiresAt: exp };
 };
 
 
+/**
+ * Loads the compressed Migaku SRS IndexedDB database and decompresses it.
+ * @returns {Promise<Uint8Array>} Raw SQLite bytes for the SRS database.
+ */
 const fetchRawSrsDb = () => {
     return new Promise((resolve) => {
         console.log("Fetching raw database")
@@ -101,6 +128,12 @@ const fetchRawSrsDb = () => {
     });
 };
 
+/**
+ * Fetches a single media blob from Migaku's file-sync API.
+ * @param {string} path - Path returned in Migaku card fields (prefixed with media://).
+ * @param {{token: string, expiresAt: number}} auth - Current auth token and expiry.
+ * @returns {Promise<Blob|null>} Media blob if fetched successfully, otherwise null.
+ */
 const fetchMigakuSrsMedia = async (path, auth) => {
     if (auth.expiresAt < Date.now()) {
         console.log("Refreshing auth token")
@@ -120,11 +153,20 @@ const fetchMigakuSrsMedia = async (path, auth) => {
     return await resp.blob();
 };
 
+/**
+ * Reads the currently selected language from the Migaku page.
+ * @returns {string} Language code configured in the Migaku UI.
+ */
 const queryMigakuSelectedLanguage = () => {
     return document.querySelector("main.MIGAKU-SRS").getAttribute("data-mgk-lang-selected");
 }
 
 
+/**
+ * Opens the Migaku SRS SQLite database using sql.js.
+ * @param {any} SQL - sql.js module instance.
+ * @returns {Promise<any>} sql.js Database instance.
+ */
 const openSrsDb = (SQL) => {
     return new Promise((resolve) => {
         fetchRawSrsDb().then((raw) => {
@@ -133,6 +175,10 @@ const openSrsDb = (SQL) => {
     });
 }
 
+/**
+ * Opens (or creates) the media cache IndexedDB used to store media blobs.
+ * @returns {Promise<IDBDatabase>} Handle to the media cache database.
+ */
 const openMediaChacheIdb = () => {
     return new Promise((resolve) => {
         const dbRequest = indexedDB.open("unofficialmgkexporterMediaDb", 1);
@@ -152,17 +198,30 @@ const openMediaChacheIdb = () => {
     });
 };
 
+/**
+ * Stores a media blob in the cache database.
+ * @param {IDBDatabase} db - Cache database handle.
+ * @param {string} key - SHA1 filename used as the cache key.
+ * @param {Blob} blob - Media blob to persist.
+ * @returns {Promise<IDBValidKey>} Key returned by IndexedDB add operation.
+ */
 const mediaCachePutBlob = (db, key, blob) => {
     return new Promise((resolve) => {
         db.transaction(STORENAME_MEDIACACHE, "readwrite")
             .objectStore(STORENAME_MEDIACACHE)
-            .add({key: key, blob: blob})
+            .add({ key: key, blob: blob })
             .onsuccess = (ev) => {
                 resolve(ev.target.result);
             }
     });
 };
 
+/**
+ * Retrieves a media blob by key from the cache.
+ * @param {IDBDatabase} db - Cache database handle.
+ * @param {string} key - SHA1 filename used as the cache key.
+ * @returns {Promise<Blob|null>} Blob if found, otherwise null.
+ */
 const mediaCacheGetByKeyOrNull = (db, key) => {
     return new Promise((resolve) => {
         const req = db.transaction(STORENAME_MEDIACACHE, "readonly")
@@ -181,11 +240,23 @@ const mediaCacheGetByKeyOrNull = (db, key) => {
     })
 };
 
+/**
+ * Checks if a media blob exists in cache.
+ * @param {IDBDatabase} db - Cache database handle.
+ * @param {string} key - SHA1 filename used as the cache key.
+ * @returns {Promise<boolean>} True if the key exists in cache.
+ */
 const mediaCacheCheckHasKey = async (db, key) => {
     return (await mediaCacheGetByKeyOrNull(db, key) !== null);
 }
 
 
+/**
+ * Converts a raw sql.js row into an object keyed by column names.
+ * @param {string[]} columnNames - Column names returned by sql.js.
+ * @param {any[]} rowVals - Raw row values returned by sql.js.
+ * @returns {Object} Plain object representation of the row.
+ */
 const convDbRowToObject = (columnNames, rowVals) => {
     const row = {};
     let i = 0;
@@ -200,6 +271,11 @@ const convDbRowToObject = (columnNames, rowVals) => {
     return row;
 };
 
+/**
+ * Converts sql.js result set into an array of objects.
+ * @param {{columns: string[], values: any[][]}} dbRes - sql.js execution result.
+ * @returns {Object[]} Array of row objects keyed by column name.
+ */
 const convDbRowsToObjectArray = (dbRes) => {
     const res = [];
     for (const val of dbRes.values) {
@@ -208,6 +284,13 @@ const convDbRowsToObjectArray = (dbRes) => {
     return res;
 };
 
+/**
+ * Executes a SQL query and returns the rows as plain objects.
+ * @param {any} db - sql.js Database handle.
+ * @param {string} query - SQL query string with placeholders.
+ * @param {any[]} [args] - Optional parameters for the query.
+ * @returns {Object[]} Rows returned by the query.
+ */
 const fetchDbRowsAsObjectArray = (db, query, args) => {
     return convDbRowsToObjectArray(
         db.exec(query, args)[0]
@@ -215,14 +298,30 @@ const fetchDbRowsAsObjectArray = (db, query, args) => {
 }
 
 
+/**
+ * Reads the list of decks from the SRS database.
+ * @param {any} db - sql.js Database handle.
+ * @returns {Object[]} Deck rows including deletion status.
+ */
 const fetchDeckList = (db) => {
     return fetchDbRowsAsObjectArray(db, "SELECT id, lang, name, del FROM deck;");
 };
 
+/**
+ * Reads all cards for a given deck.
+ * @param {any} db - sql.js Database handle.
+ * @param {number} deckId - Deck identifier.
+ * @returns {Object[]} Card rows for the specified deck.
+ */
 const fetchDeckCards = (db, deckId) => {
     return fetchDbRowsAsObjectArray(db, "SELECT id, mod, del, cardTypeId, created, primaryField, secondaryField, fields, words, due, interval, factor, lastReview, reviewCount, passCount, failCount, suspended FROM card WHERE deckId=?", [deckId]);
 };
 
+/**
+ * Reads card type definitions and parses their JSON configs.
+ * @param {any} db - sql.js Database handle.
+ * @returns {Map<number, Object>} Map of card type id to card type object.
+ */
 const fetchCardTypes = (db) => {
     let rows = fetchDbRowsAsObjectArray(db, "SELECT id, del, lang, name, config FROM card_type");
     const res = new Map();
@@ -233,15 +332,31 @@ const fetchCardTypes = (db) => {
     return res;
 };
 
+/**
+ * Reads review history entries from the SRS database.
+ * @param {any} db - sql.js Database handle.
+ * @returns {Object[]} Review rows sorted by database order.
+ */
 const fetchReviewHistory = (db) => {
     return fetchDbRowsAsObjectArray(db, "SELECT id, mod, del, day, interval, factor, cardId, duration, type, lapseIndex FROM review");
 };
 
+/**
+ * Fetches word list entries for a specific language.
+ * @param {any} db - sql.js Database handle.
+ * @param {string} lang - Language code.
+ * @returns {Object[]} Word list rows for the language.
+ */
 const fetchWordListForLang = (db, lang) => {
     return fetchDbRowsAsObjectArray(db, "SELECT dictForm, secondary, partOfSpeech, language, mod, serverMod, del, knownStatus, hasCard, tracked FROM WordList WHERE language=?", [lang]);
 }
 
 
+/**
+ * Creates an empty Anki collection schema in a new sql.js database.
+ * @param {any} SQL - sql.js module instance.
+ * @returns {any} Initialized Anki-compatible database.
+ */
 const initNewAnkiSqlDb = (SQL) => {
     const db = new SQL.Database();
     db.run(`
@@ -320,6 +435,12 @@ const initNewAnkiSqlDb = (SQL) => {
     return db;
 };
 
+/**
+ * Seeds the Anki col table and builds models/decks based on used card types.
+ * @param {any} db - Anki sql.js database.
+ * @param {Array<Object>} usedCardTypes - Card types referenced by exported cards.
+ * @returns {Map<number, number>} Mapping of Migaku card type id to Anki model id.
+ */
 const ankiDbPutCol = (db, usedCardTypes) => {
     // TODO: Add fields for all the card types
     const cardTypeIdsToModelIds = new Map();
@@ -375,6 +496,24 @@ const ankiDbPutCol = (db, usedCardTypes) => {
                 };
                 break;
             case "Word":
+                cardType.config.fields.forEach((x) => pushField(x.name));
+                const fieldNames = cardType.config.fields.map((f) => f.name);
+                const answerBlocks = cardType.config.fields
+                    .map((f) => `<div><b>${f.name}</b>: {{${f.name}}}</div>`)
+                    .join("<br>");
+                template = {
+                    name: "Basic",
+                    qfmt: fieldNames.length > 0 ? `{{${fieldNames[0]}}}` : "{{Front}}",
+                    did: null,
+                    bafmt: "",
+                    afmt: `
+                        {{FrontSide}}<hr id="answer"><br>
+                        ${answerBlocks}
+                    `,
+                    ord: 0,
+                    bqfmt: "",
+                };
+                break;
             case "Audio Sentence":
             case "Audio Word":
             default:
@@ -486,11 +625,22 @@ const ankiDbPutCol = (db, usedCardTypes) => {
     return cardTypeIdsToModelIds;
 };
 
+/**
+ * Updates both console and on-page status text.
+ * @param {string} message - Status to display.
+ */
 const setStatus = (message) => {
     console.log(message);
     document.getElementById(statusMessageElemId).innerText = message;
 };
 
+/**
+ * Prepares and downloads all media referenced by cards, writing them to cache.
+ * @param {IDBDatabase} mediacacheDb - Cache database handle.
+ * @param {Map<number, Object[]>} cardsByCardType - Cards grouped by card type id.
+ * @param {Map<number, Object>} cardTypes - Card type metadata keyed by id.
+ * @returns {Promise<Map<string, string>>} Map of original media path to hashed zip filename.
+ */
 const mediaCacheGatherAllMedia = async (mediacacheDb, cardsByCardType, cardTypes) => {
     return new Promise(async (resolve, reject) => {
         const pathSet = new Set();
@@ -530,6 +680,7 @@ const mediaCacheGatherAllMedia = async (mediacacheDb, cardsByCardType, cardTypes
         const fullMediaCount = queue.length;
         let accessToken = await fetchAccessToken();
         let mediaMap = new Map();
+        // Worker consumes media paths from the shared queue until none remain.
         const workerProc = async () => {
             while (queue.length > 0) {
                 const path = queue.shift();
@@ -579,9 +730,25 @@ const mediaCacheGatherAllMedia = async (mediacacheDb, cardsByCardType, cardTypes
     });
 };
 
+/**
+ * Writes notes/cards and optional media into the Anki database and zip.
+ * @param {any} db - Anki sql.js database.
+ * @param {IDBDatabase} mediacacheDb - Media cache database.
+ * @param {JSZip} zipHandle - Zip instance collecting the apkg files.
+ * @param {Map<number, Object[]>} cardsByCardType - Cards grouped by card type id.
+ * @param {Map<number, Object>} cardTypes - Card type metadata keyed by id.
+ * @param {Map<number, number>} cardTypeIdsToModelIds - Mapping from Migaku card type id to Anki model id.
+ * @param {boolean} shouldIncludeMedia - Whether to package media files.
+ * @param {boolean} keepSyntax - Whether to retain Migaku syntax markers.
+ */
 const ankiDbFillCards = async (db, mediacacheDb, zipHandle, cardsByCardType, cardTypes, cardTypeIdsToModelIds, shouldIncludeMedia, keepSyntax) => {
     const invertedMediaMap = new Map();
     let curMediaNum = 0;
+    /**
+     * Adds a media path to the zip (if cached) and returns the hashed filename.
+     * @param {string} dirtyPath - Migaku media path prefixed with media://.
+     * @returns {Promise<string|null>} Hashed filename or null when missing.
+     */
     const zipMedia = async (dirtyPath) => {
         if (dirtyPath.trim().length === 0) return null;
         const path = dirtyPath.slice(5);
@@ -620,6 +787,10 @@ const ankiDbFillCards = async (db, mediacacheDb, zipHandle, cardsByCardType, car
         let i = 0;
         for (const card of cardList) {
             const fieldsList = [];
+            /**
+             * Normalizes a Migaku field into Anki-safe content based on field type.
+             * @param {string} x - Raw field value from Migaku.
+             */
             const pushField = async (x) => {
                 const fieldIdx = fieldsList.length;
                 if (fieldIdx >= defCardFields.length) return;
@@ -749,10 +920,16 @@ const ankiDbFillCards = async (db, mediacacheDb, zipHandle, cardsByCardType, car
     db.run("COMMIT");
 
     zipHandle.file("media", JSON.stringify(Object.fromEntries(new Map(
-       Array.from(invertedMediaMap, x => x.reverse())
+        Array.from(invertedMediaMap, x => x.reverse())
     ))));
 };
 
+/**
+ * Inserts revlog rows derived from Migaku review history.
+ * @param {any} db - Anki sql.js database.
+ * @param {Object[]} reviewHistory - Migaku review events.
+ * @param {Object[]} cards - Card list (unused but kept for parity).
+ */
 const ankiDbFillRevlog = (db, reviewHistory, cards) => {
     const revIntervals = new Map();
     reviewHistory.sort((a, b) => a.id - b.id);
@@ -799,6 +976,15 @@ const ankiDbFillRevlog = (db, reviewHistory, cards) => {
 };
 
 
+/**
+ * Orchestrates deck export: gather cards/media, build Anki DB, and download apkg.
+ * @param {any} SQL - sql.js module instance.
+ * @param {any} db - Migaku SRS database.
+ * @param {number} deckId - Deck identifier.
+ * @param {string} deckName - Deck name for the exported file.
+ * @param {boolean} shouldIncludeMedia - Whether to include media.
+ * @param {boolean} keepSyntax - Whether to keep Migaku syntax markup.
+ */
 const doExportDeck = async (SQL, db, deckId, deckName, shouldIncludeMedia, keepSyntax) => {
     const cards = fetchDeckCards(db, deckId).filter((x) => !x.del);
     const cardTypes = fetchCardTypes(db);
@@ -829,7 +1015,7 @@ const doExportDeck = async (SQL, db, deckId, deckName, shouldIncludeMedia, keepS
     const exportedDb = ankiDb.export();
     zip.file("collection.anki2", exportedDb);
     setStatus(`Constructing apkg file (be patient)`);
-    zip.generateAsync({type: "blob"}).then((zipBlob) => {
+    zip.generateAsync({ type: "blob" }).then((zipBlob) => {
         setStatus("Done");
 
         const url = URL.createObjectURL(zipBlob);
@@ -844,6 +1030,11 @@ const doExportDeck = async (SQL, db, deckId, deckName, shouldIncludeMedia, keepS
     });
 };
 
+/**
+ * Exports Migaku word status lists as CSV files bundled in a zip.
+ * @param {any} db - Migaku SRS database.
+ * @param {string} lang - Language code to export.
+ */
 const doExportWordlist = async (db, lang) => {
     const wordList = fetchWordListForLang(db, lang);
 
@@ -877,10 +1068,20 @@ const doExportWordlist = async (db, lang) => {
         }
     }
 
+    /**
+     * Escapes a CSV cell by doubling quotes and wrapping in quotes.
+     * @param {string} x - Raw string value.
+     * @returns {string} CSV-safe cell.
+     */
     const escape = (x) => {
         return '"' + x.replaceAll('"', '""') + '"';
     }
 
+    /**
+     * Serializes a list of word entries to CSV text.
+     * @param {Object[]} arr - Word entries with dictForm/secondary/hasCard.
+     * @returns {string} CSV representation of the list.
+     */
     const arrToCsv = (arr) => {
         const header = "dictForm,secondary,hasCard";
         const rows = new Array();
@@ -896,7 +1097,7 @@ const doExportWordlist = async (db, lang) => {
     zip.file("learning.csv", arrToCsv(learning));
     zip.file("known.csv", arrToCsv(known));
     zip.file("tracked.csv", arrToCsv(tracked));
-    zip.generateAsync({type: "blob"}).then((zipBlob) => {
+    zip.generateAsync({ type: "blob" }).then((zipBlob) => {
         const url = URL.createObjectURL(zipBlob);
 
         const dlElem = document.createElement("a");
@@ -910,6 +1111,10 @@ const doExportWordlist = async (db, lang) => {
 };
 
 
+/**
+ * Waits for the Migaku decks area to render before injecting UI.
+ * @param {Function} cb - Callback invoked once the UI is available.
+ */
 function waitForMigaku(cb) {
     const observer = new MutationObserver((_, observer) => {
         if (document.querySelector(".HomeDecks")) {
@@ -917,12 +1122,16 @@ function waitForMigaku(cb) {
             cb();
         }
     });
-    observer.observe(document, {childList: true, subtree: true});
+    observer.observe(document, { childList: true, subtree: true });
 };
 
 
+// Cache the sql.js-backed SRS database once opened to avoid reloading.
 let srsDb = null;
 
+/**
+ * Entry point that wires UI controls and kicks off exports.
+ */
 const inject = async () => {
     const SQL = await initSqlJs({ locateFile: () => GM_getResourceURL("sql_wasm") });
 
