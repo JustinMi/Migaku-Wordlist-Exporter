@@ -192,34 +192,20 @@ const doExportWordlist = async (db, lang) => {
     }
 
     /**
-     * Escapes a CSV cell by doubling quotes and wrapping in quotes.
-     * @param {string} x - Raw string value.
-     * @returns {string} CSV-safe cell.
+     * Serializes a list of word entries to a single-line JSON array of dict forms.
+     * @param {Object[]} arr - Word entries with dictForm.
+     * @returns {string} JSON representation of the list.
      */
-    const escape = (x) => {
-        return '"' + x.replaceAll('"', '""') + '"';
-    }
-
-    /**
-     * Serializes a list of word entries to CSV text.
-     * @param {Object[]} arr - Word entries with dictForm/secondary/hasCard.
-     * @returns {string} CSV representation of the list.
-     */
-    const arrToCsv = (arr) => {
-        const header = "dictForm,secondary,hasCard";
-        const rows = new Array();
-        for (const word of arr) {
-            rows.push(`${escape(word.dictForm)},${escape(word.secondary)},${word.hasCard}`);
-        }
-        return header + "\n" + rows.join("\n");
+    const arrToJson = (arr) => {
+        return JSON.stringify(arr.map((word) => word.dictForm));
     };
 
     let zip = new JSZip();
-    zip.file("unknown.csv", arrToCsv(unknown));
-    zip.file("ignored.csv", arrToCsv(ignored));
-    zip.file("learning.csv", arrToCsv(learning));
-    zip.file("known.csv", arrToCsv(known));
-    zip.file("tracked.csv", arrToCsv(tracked));
+    zip.file("unknown.json", arrToJson(unknown));
+    zip.file("ignored.json", arrToJson(ignored));
+    zip.file("learning.json", arrToJson(learning));
+    zip.file("known.json", arrToJson(known));
+    zip.file("tracked.json", arrToJson(tracked));
     zip.generateAsync({ type: "blob" }).then((zipBlob) => {
         const url = URL.createObjectURL(zipBlob);
 
