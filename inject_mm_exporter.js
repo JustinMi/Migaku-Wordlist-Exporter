@@ -15,8 +15,6 @@
 
 // ID assigned to the status message element injected into the Migaku UI.
 const statusMessageElemId = "mgkexporterStatusMessage";
-// IndexedDB object store name used to cache media blobs between exports.
-const STORENAME_MEDIACACHE = "mediacache"
 
 
 /**
@@ -45,55 +43,6 @@ const decompress = async (blob) => {
     return res;
 };
 
-
-
-/**
- * Reads Firebase auth info that Migaku stores in IndexedDB.
- * @returns {Promise<any[]>} Promise resolving to all rows in firebaseLocalStorage.
- */
-const fetchFirebaseLocalStorageDbRows = () => {
-    return new Promise((resolve) => {
-        console.log("Fetching firebase database")
-        const dbRequest = indexedDB.open('firebaseLocalStorageDb', 1);
-        dbRequest.onsuccess = function (event) {
-            const idb = dbRequest.result;
-            const transaction = idb.transaction('firebaseLocalStorage', 'readonly');
-            const objectStore = transaction.objectStore('firebaseLocalStorage');
-            objectStore.getAll().onsuccess = (event) => {
-                resolve(event.target.result);
-            };
-            idb.close();
-        };
-    });
-};
-
-/**
- * Exchanges a Firebase refresh token for an access token.
- * @param {string} firebaseApiKey - Firebase API key stored in IndexedDB.
- * @param {string} refreshToken - Refresh token used to obtain a new access token.
- * @returns {Promise<any>} JSON response from Google's securetoken endpoint.
- */
-const fetchGoogleAuth = async (firebaseApiKey, refreshToken) => {
-    const url = `https://securetoken.googleapis.com/v1/token?key=${firebaseApiKey}`
-    const resp = await fetch(url, {
-        method: "post", body: new URLSearchParams({
-            "grant_type": "refresh_token",
-            "refresh_token": refreshToken,
-        })
-    });
-    return await resp.json();
-};
-
-/**
- * Retrieves the current Firebase access token and its expiration.
- * @returns {Promise<{token: string, expiresAt: number}>} Access token with expiration timestamp (ms).
- */
-const fetchAccessToken = async () => {
-    const firebaseInfo = (await fetchFirebaseLocalStorageDbRows())[0].value;
-    const auth = await fetchGoogleAuth(firebaseInfo.apiKey, firebaseInfo.stsTokenManager.refreshToken);
-    let exp = Date.now() + ((Number(auth.expires_in) - 5) * 1000);
-    return { token: auth.access_token, expiresAt: exp };
-};
 
 
 /**
@@ -129,31 +78,6 @@ const fetchRawSrsDb = () => {
 };
 
 /**
- * Fetches a single media blob from Migaku's file-sync API.
- * @param {string} path - Path returned in Migaku card fields (prefixed with media://).
- * @param {{token: string, expiresAt: number}} auth - Current auth token and expiry.
- * @returns {Promise<Blob|null>} Media blob if fetched successfully, otherwise null.
- */
-const fetchMigakuSrsMedia = async (path, auth) => {
-    if (auth.expiresAt < Date.now()) {
-        console.log("Refreshing auth token")
-        const newAuth = await fetchAccessToken();
-        auth.token = newAuth.token;
-        auth.expiresAt = newAuth.expiresAt;
-    }
-    const baseUrl = "https://file-sync-worker-api.migaku.com/data/"
-    const url = baseUrl + path;
-    const resp = await fetch(url, {
-        headers: {
-            "Authorization": "Bearer " + auth.token,
-        },
-        cache: "force-cache",
-    });
-    if (resp.status !== 200) return null;
-    return await resp.blob();
-};
-
-/**
  * Reads the currently selected language from the Migaku page.
  * @returns {string} Language code configured in the Migaku UI.
  */
@@ -175,83 +99,7 @@ const openSrsDb = (SQL) => {
     });
 }
 
-/**
- * Opens (or creates) the media cache IndexedDB used to store media blobs.
- * @returns {Promise<IDBDatabase>} Handle to the media cache database.
- */
-const openMediaChacheIdb = () => {
-    return new Promise((resolve) => {
-        const dbRequest = indexedDB.open("unofficialmgkexporterMediaDb", 1);
-        dbRequest.onupgradeneeded = (ev) => {
-            const idb = ev.target.result;
-            if (!idb.objectStoreNames.contains(STORENAME_MEDIACACHE)) {
-                idb.createObjectStore(STORENAME_MEDIACACHE, {
-                    keyPath: "key",
-                    autoIncrement: false,
-                });
-            }
-        };
-        dbRequest.onsuccess = (ev) => {
-            const idb = ev.target.result;
-            resolve(idb);
-        };
-    });
-};
-
-/**
- * Stores a media blob in the cache database.
- * @param {IDBDatabase} db - Cache database handle.
- * @param {string} key - SHA1 filename used as the cache key.
- * @param {Blob} blob - Media blob to persist.
- * @returns {Promise<IDBValidKey>} Key returned by IndexedDB add operation.
- */
-const mediaCachePutBlob = (db, key, blob) => {
-    return new Promise((resolve) => {
-        db.transaction(STORENAME_MEDIACACHE, "readwrite")
-            .objectStore(STORENAME_MEDIACACHE)
-            .add({ key: key, blob: blob })
-            .onsuccess = (ev) => {
-                resolve(ev.target.result);
-            }
-    });
-};
-
-/**
- * Retrieves a media blob by key from the cache.
- * @param {IDBDatabase} db - Cache database handle.
- * @param {string} key - SHA1 filename used as the cache key.
- * @returns {Promise<Blob|null>} Blob if found, otherwise null.
- */
-const mediaCacheGetByKeyOrNull = (db, key) => {
-    return new Promise((resolve) => {
-        const req = db.transaction(STORENAME_MEDIACACHE, "readonly")
-            .objectStore(STORENAME_MEDIACACHE)
-            .get(key);
-        req.onsuccess = (ev) => {
-            if (ev.target.result) {
-                resolve(ev.target.result.blob);
-            } else {
-                resolve(null);
-            }
-        };
-        req.onerror = (_) => {
-            resolve(null);
-        }
-    })
-};
-
-/**
- * Checks if a media blob exists in cache.
- * @param {IDBDatabase} db - Cache database handle.
- * @param {string} key - SHA1 filename used as the cache key.
- * @returns {Promise<boolean>} True if the key exists in cache.
- */
-const mediaCacheCheckHasKey = async (db, key) => {
-    return (await mediaCacheGetByKeyOrNull(db, key) !== null);
-}
-
-
-/**
+/** 
  * Converts a raw sql.js row into an object keyed by column names.
  * @param {string[]} columnNames - Column names returned by sql.js.
  * @param {any[]} rowVals - Raw row values returned by sql.js.
@@ -495,7 +343,7 @@ const ankiDbPutCol = (db, usedCardTypes) => {
                     bqfmt: "",
                 };
                 break;
-            case "Word":
+            case "Word": {
                 cardType.config.fields.forEach((x) => pushField(x.name));
                 const fieldNames = cardType.config.fields.map((f) => f.name);
                 const answerBlocks = cardType.config.fields
@@ -514,6 +362,7 @@ const ankiDbPutCol = (db, usedCardTypes) => {
                     bqfmt: "",
                 };
                 break;
+            }
             case "Audio Sentence":
             case "Audio Word":
             default:
@@ -635,148 +484,15 @@ const setStatus = (message) => {
 };
 
 /**
- * Prepares and downloads all media referenced by cards, writing them to cache.
- * @param {IDBDatabase} mediacacheDb - Cache database handle.
- * @param {Map<number, Object[]>} cardsByCardType - Cards grouped by card type id.
- * @param {Map<number, Object>} cardTypes - Card type metadata keyed by id.
- * @returns {Promise<Map<string, string>>} Map of original media path to hashed zip filename.
- */
-const mediaCacheGatherAllMedia = async (mediacacheDb, cardsByCardType, cardTypes) => {
-    return new Promise(async (resolve, reject) => {
-        const pathSet = new Set();
-        setStatus("Preparing media paths")
-        for (const typeKey of cardsByCardType.keys()) {
-            const cardList = cardsByCardType.get(typeKey);
-            const cardType = cardTypes.get(typeKey);
-            const defCardFields = cardType.config.fields;
-            for (const card of cardList) {
-                let fieldIdx = 0;
-                const handleField = (x) => {
-                    if (fieldIdx >= defCardFields.length) return;
-                    const fieldInfo = defCardFields[fieldIdx];
-                    fieldIdx++;
-                    switch (fieldInfo.type) {
-                        case "IMAGE":
-                        case "AUDIO":
-                        case "AUDIO_LONG":
-                            if (x.trim().length === 0) return;
-                            pathSet.add(x.slice(5));
-                            break
-                        default:
-                            break;
-                    }
-                };
-                handleField(card.primaryField);
-                handleField(card.secondaryField);
-                for (const part of card.fields.split("\u001f")) {
-                    handleField(part);
-                }
-            }
-        }
-        setStatus("Beginning media download");
-
-        let dlCount = 0;
-        let queue = Array.from(pathSet);
-        const fullMediaCount = queue.length;
-        let accessToken = await fetchAccessToken();
-        let mediaMap = new Map();
-        // Worker consumes media paths from the shared queue until none remain.
-        const workerProc = async () => {
-            while (queue.length > 0) {
-                const path = queue.shift();
-
-                let extension = "." + path.split(".").pop();
-                if (extension.length >= 7) {
-                    extension = "";
-                }
-                const zipPath = Array.from(
-                    new Uint8Array(
-                        await window.crypto.subtle.digest(
-                            "SHA-1",
-                            new TextEncoder().encode(path)
-                        )
-                    )
-                ).map((b) => b.toString(16).padStart(2, "0")).join("") + extension;
-
-                if (await mediaCacheCheckHasKey(mediacacheDb, zipPath)) {
-                    dlCount++;
-                    setStatus(`${dlCount}/${fullMediaCount}\n From cache ${path}`);
-                    mediaMap.set(path, zipPath);
-                    continue;
-                }
-                console.log(`STARTING ${path}`)
-                let blob = await fetchMigakuSrsMedia(path, accessToken);
-                dlCount++;
-                setStatus(`${dlCount}/${fullMediaCount}\n Downloaded ${path}`);
-                if (!blob) {
-                    continue;
-                } else {
-                    mediaCachePutBlob(mediacacheDb, zipPath, blob);
-                    mediaMap.set(path, zipPath);
-                }
-            }
-        };
-
-        const workerCount = 5; // TODO: Can this be raised safely?
-        let workerPromises = new Array();
-        for (let i = 0; i < workerCount; i++) {
-            workerPromises.push(workerProc());
-        }
-        Promise.all(workerPromises).then(() => {
-            resolve(mediaMap);
-        }, () => {
-            reject();
-        });
-    });
-};
-
-/**
- * Writes notes/cards and optional media into the Anki database and zip.
+ * Writes notes/cards into the Anki database and zip (media is omitted).
  * @param {any} db - Anki sql.js database.
- * @param {IDBDatabase} mediacacheDb - Media cache database.
  * @param {JSZip} zipHandle - Zip instance collecting the apkg files.
  * @param {Map<number, Object[]>} cardsByCardType - Cards grouped by card type id.
  * @param {Map<number, Object>} cardTypes - Card type metadata keyed by id.
  * @param {Map<number, number>} cardTypeIdsToModelIds - Mapping from Migaku card type id to Anki model id.
- * @param {boolean} shouldIncludeMedia - Whether to package media files.
  * @param {boolean} keepSyntax - Whether to retain Migaku syntax markers.
  */
-const ankiDbFillCards = async (db, mediacacheDb, zipHandle, cardsByCardType, cardTypes, cardTypeIdsToModelIds, shouldIncludeMedia, keepSyntax) => {
-    const invertedMediaMap = new Map();
-    let curMediaNum = 0;
-    /**
-     * Adds a media path to the zip (if cached) and returns the hashed filename.
-     * @param {string} dirtyPath - Migaku media path prefixed with media://.
-     * @returns {Promise<string|null>} Hashed filename or null when missing.
-     */
-    const zipMedia = async (dirtyPath) => {
-        if (dirtyPath.trim().length === 0) return null;
-        const path = dirtyPath.slice(5);
-        let extension = "." + path.split(".").pop();
-        if (extension.length >= 7) {
-            extension = "";
-        }
-        const zipPath = Array.from(
-            new Uint8Array(
-                await window.crypto.subtle.digest(
-                    "SHA-1",
-                    new TextEncoder().encode(path)
-                )
-            )
-        ).map((b) => b.toString(16).padStart(2, "0")).join("") + extension;
-        if (!invertedMediaMap.has(zipPath)) {
-            const mediaBlob = await mediaCacheGetByKeyOrNull(mediacacheDb, zipPath);
-            if (!mediaBlob) {
-                return null;
-            } else {
-                zipHandle.file(curMediaNum, mediaBlob);
-                invertedMediaMap.set(zipPath, curMediaNum.toString());
-                curMediaNum++;
-            }
-        }
-        return zipPath;
-    };
-
+const ankiDbFillCards = async (db, zipHandle, cardsByCardType, cardTypes, cardTypeIdsToModelIds, keepSyntax) => {
     setStatus("Converting cards")
     db.run("BEGIN TRANSACTION;");
     for (const typeKey of cardsByCardType.keys()) {
@@ -791,7 +507,7 @@ const ankiDbFillCards = async (db, mediacacheDb, zipHandle, cardsByCardType, car
              * Normalizes a Migaku field into Anki-safe content based on field type.
              * @param {string} x - Raw field value from Migaku.
              */
-            const pushField = async (x) => {
+            const pushField = (x) => {
                 const fieldIdx = fieldsList.length;
                 if (fieldIdx >= defCardFields.length) return;
                 const fieldInfo = defCardFields[fieldIdx];
@@ -808,39 +524,17 @@ const ankiDbFillCards = async (db, mediacacheDb, zipHandle, cardsByCardType, car
                         fieldsList.push(x);
                         break;
                     case "IMAGE":
-                        if (shouldIncludeMedia) {
-                            const zipPath = await zipMedia(x);
-                            if (zipPath) {
-                                fieldsList.push(`<img src="${zipPath}>`);
-                            } else {
-                                fieldsList.push("");
-                            }
-                        } else {
-                            fieldsList.push("");
-                        }
-                        break;
                     case "AUDIO":
                     case "AUDIO_LONG":
-                        if (shouldIncludeMedia) {
-                            const zipPath = await zipMedia(x);
-                            if (zipPath) {
-                                fieldsList.push(`[sound:${zipPath}]`);
-                            } else {
-                                fieldsList.push("");
-                            }
-                        } else {
-                            fieldsList.push("");
-                        }
-                        break;
                     default:
                         window.alert("Unable to handle card field definition: " + fieldInfo.toString());
                         break;
                 }
             }
-            await pushField(card.primaryField);
-            await pushField(card.secondaryField);
+            pushField(card.primaryField);
+            pushField(card.secondaryField);
             for (const part of card.fields.split("\u001f")) {
-                await pushField(part);
+                pushField(part);
             }
             while (fieldsList.length < defCardFields.length) {
                 fieldsList.push("");
@@ -919,9 +613,7 @@ const ankiDbFillCards = async (db, mediacacheDb, zipHandle, cardsByCardType, car
     }
     db.run("COMMIT");
 
-    zipHandle.file("media", JSON.stringify(Object.fromEntries(new Map(
-        Array.from(invertedMediaMap, x => x.reverse())
-    ))));
+    zipHandle.file("media", "{}");
 };
 
 /**
@@ -977,15 +669,14 @@ const ankiDbFillRevlog = (db, reviewHistory, cards) => {
 
 
 /**
- * Orchestrates deck export: gather cards/media, build Anki DB, and download apkg.
+ * Orchestrates deck export: gather cards, build Anki DB, and download apkg.
  * @param {any} SQL - sql.js module instance.
  * @param {any} db - Migaku SRS database.
  * @param {number} deckId - Deck identifier.
  * @param {string} deckName - Deck name for the exported file.
- * @param {boolean} shouldIncludeMedia - Whether to include media.
  * @param {boolean} keepSyntax - Whether to keep Migaku syntax markup.
  */
-const doExportDeck = async (SQL, db, deckId, deckName, shouldIncludeMedia, keepSyntax) => {
+const doExportDeck = async (SQL, db, deckId, deckName, keepSyntax) => {
     const cards = fetchDeckCards(db, deckId).filter((x) => !x.del);
     const cardTypes = fetchCardTypes(db);
 
@@ -999,18 +690,13 @@ const doExportDeck = async (SQL, db, deckId, deckName, shouldIncludeMedia, keepS
 
     const usedCardTypes = Array.from(cardsByCardType.keys()).map((x) => cardTypes.get(x));
 
-    const mediacacheDb = await openMediaChacheIdb();
-    if (shouldIncludeMedia) {
-        await mediaCacheGatherAllMedia(mediacacheDb, cardsByCardType, cardTypes);
-    }
-
     let zip = new JSZip();
     const ankiDb = initNewAnkiSqlDb(SQL);
 
     const reviewHistory = fetchReviewHistory(db).filter((x) => !x.del);
     ankiDbFillRevlog(ankiDb, reviewHistory, cards);
     const cardTypeIdsToModelIds = ankiDbPutCol(ankiDb, usedCardTypes);
-    await ankiDbFillCards(ankiDb, mediacacheDb, zip, cardsByCardType, cardTypes, cardTypeIdsToModelIds, shouldIncludeMedia, keepSyntax);
+    await ankiDbFillCards(ankiDb, zip, cardsByCardType, cardTypes, cardTypeIdsToModelIds, keepSyntax);
 
     const exportedDb = ankiDb.export();
     zip.file("collection.anki2", exportedDb);
@@ -1153,25 +839,17 @@ const inject = async () => {
     exportButton.innerText = "Export deck";
 
     div.appendChild(document.createElement("br"));
-    const includeMediaCheckbox = div.appendChild(document.createElement("input"))
-    includeMediaCheckbox.type = "checkbox"
-    includeMediaCheckbox.id = "mgkexporterCheckbox";
-    const includeMediaLabel = div.appendChild(document.createElement("label"));
-    includeMediaLabel.for = includeMediaCheckbox.id;
-    includeMediaLabel.innerText = "Include media (this may take a very long time and could fail)"
-
-    div.appendChild(document.createElement("br"));
-    const keepSyntaxCheckbox = div.appendChild(document.createElement("input"))
-    keepSyntaxCheckbox.type = "checkbox"
+    const keepSyntaxCheckbox = div.appendChild(document.createElement("input"));
+    keepSyntaxCheckbox.type = "checkbox";
     keepSyntaxCheckbox.id = "mgkexporterKeepsyntaxCheckbox";
     const keepSyntaxLabel = div.appendChild(document.createElement("label"));
-    keepSyntaxLabel.for = includeMediaCheckbox.id;
-    keepSyntaxLabel.innerText = "Keep migaku syntax (your note type can display furigana with it)"
+    keepSyntaxLabel.htmlFor = keepSyntaxCheckbox.id;
+    keepSyntaxLabel.innerText = "Keep migaku syntax (your note type can display furigana with it)";
 
     exportButton.onclick = async () => {
         const deckId = deckSelect.options[deckSelect.selectedIndex].value;
         const deckName = deckSelect.options[deckSelect.selectedIndex].innerText;
-        await doExportDeck(SQL, srsDb, deckId, deckName, includeMediaCheckbox.checked, keepSyntaxCheckbox.checked);
+        await doExportDeck(SQL, srsDb, deckId, deckName, keepSyntaxCheckbox.checked);
     };
 
     const statusMessageElem = div.appendChild(document.createElement("div"));
