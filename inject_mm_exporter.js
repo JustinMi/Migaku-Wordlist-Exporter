@@ -191,6 +191,8 @@ const doExportWordlist = async (db, lang) => {
         }
     }
 
+    console.log(`Wordlist counts — Known: ${known.length}, Unknown: ${unknown.length}, Ignored: ${ignored.length}, Tracked: ${tracked.length}, Learning: ${learning.length}`);
+
     /**
      * Serializes a list of word entries to a single-line JSON array of dict forms.
      * @param {Object[]} arr - Word entries with dictForm.
