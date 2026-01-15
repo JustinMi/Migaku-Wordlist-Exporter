@@ -490,9 +490,8 @@ const setStatus = (message) => {
  * @param {Map<number, Object[]>} cardsByCardType - Cards grouped by card type id.
  * @param {Map<number, Object>} cardTypes - Card type metadata keyed by id.
  * @param {Map<number, number>} cardTypeIdsToModelIds - Mapping from Migaku card type id to Anki model id.
- * @param {boolean} keepSyntax - Whether to retain Migaku syntax markers.
  */
-const ankiDbFillCards = async (db, zipHandle, cardsByCardType, cardTypes, cardTypeIdsToModelIds, keepSyntax) => {
+const ankiDbFillCards = async (db, zipHandle, cardsByCardType, cardTypes, cardTypeIdsToModelIds) => {
     setStatus("Converting cards")
     db.run("BEGIN TRANSACTION;");
     for (const typeKey of cardsByCardType.keys()) {
@@ -513,12 +512,8 @@ const ankiDbFillCards = async (db, zipHandle, cardsByCardType, cardTypes, cardTy
                 const fieldInfo = defCardFields[fieldIdx];
                 switch (fieldInfo.type) {
                     case "SYNTAX":
-                        if (keepSyntax) {
-                            fieldsList.push(x);
-                        } else {
-                            // TODO: Maybe translate syntax into proper ruby text?
-                            fieldsList.push(x.replaceAll(/\[.*?\]/g, "").replaceAll("{", "").replaceAll("}", ""));
-                        }
+                        // Strip Migaku syntax markers for plain text export.
+                        fieldsList.push(x.replaceAll(/\[.*?\]/g, "").replaceAll("{", "").replaceAll("}", ""));
                         break;
                     case "TEXT":
                         fieldsList.push(x);
@@ -674,9 +669,8 @@ const ankiDbFillRevlog = (db, reviewHistory, cards) => {
  * @param {any} db - Migaku SRS database.
  * @param {number} deckId - Deck identifier.
  * @param {string} deckName - Deck name for the exported file.
- * @param {boolean} keepSyntax - Whether to keep Migaku syntax markup.
  */
-const doExportDeck = async (SQL, db, deckId, deckName, keepSyntax) => {
+const doExportDeck = async (SQL, db, deckId, deckName) => {
     const cards = fetchDeckCards(db, deckId).filter((x) => !x.del);
     const cardTypes = fetchCardTypes(db);
 
@@ -696,7 +690,7 @@ const doExportDeck = async (SQL, db, deckId, deckName, keepSyntax) => {
     const reviewHistory = fetchReviewHistory(db).filter((x) => !x.del);
     ankiDbFillRevlog(ankiDb, reviewHistory, cards);
     const cardTypeIdsToModelIds = ankiDbPutCol(ankiDb, usedCardTypes);
-    await ankiDbFillCards(ankiDb, zip, cardsByCardType, cardTypes, cardTypeIdsToModelIds, keepSyntax);
+    await ankiDbFillCards(ankiDb, zip, cardsByCardType, cardTypes, cardTypeIdsToModelIds);
 
     const exportedDb = ankiDb.export();
     zip.file("collection.anki2", exportedDb);
@@ -838,18 +832,10 @@ const inject = async () => {
     const exportButton = div.appendChild(document.createElement("button"));
     exportButton.innerText = "Export deck";
 
-    div.appendChild(document.createElement("br"));
-    const keepSyntaxCheckbox = div.appendChild(document.createElement("input"));
-    keepSyntaxCheckbox.type = "checkbox";
-    keepSyntaxCheckbox.id = "mgkexporterKeepsyntaxCheckbox";
-    const keepSyntaxLabel = div.appendChild(document.createElement("label"));
-    keepSyntaxLabel.htmlFor = keepSyntaxCheckbox.id;
-    keepSyntaxLabel.innerText = "Keep migaku syntax (your note type can display furigana with it)";
-
     exportButton.onclick = async () => {
         const deckId = deckSelect.options[deckSelect.selectedIndex].value;
         const deckName = deckSelect.options[deckSelect.selectedIndex].innerText;
-        await doExportDeck(SQL, srsDb, deckId, deckName, keepSyntaxCheckbox.checked);
+        await doExportDeck(SQL, srsDb, deckId, deckName);
     };
 
     const statusMessageElem = div.appendChild(document.createElement("div"));
